@@ -101,7 +101,7 @@ Para contribuir:
 
 ## 💖 Doações
 
-Se você quiser apoiar o desenvolvimento do Black Knight, pode fazer uma doação via **PIX**: `16303802702`\
+Se você quiser apoiar o desenvolvimento de scripts para Red Team, pode fazer uma doação via **PIX**: `16303802702`\
 Agradecemos muito pelo seu apoio! 🙏
 
 ---
