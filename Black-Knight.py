@@ -1,13 +1,7 @@
-import requests
-import concurrent.futures
-import random
-import time
-import csv
-import argparse
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin, quote
+import requests, re, json
 from bs4 import BeautifulSoup
-import threading
-import json
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote, urljoin
+import concurrent.futures, random, threading, csv, argparse, time
 
 # ---------------- CONFIGURAÇÃO ----------------
 params_to_test = [
@@ -20,17 +14,9 @@ params_to_test = [
 ]
 
 TEST_DOMAIN = "https://meu-webhook.com"
-MIN_DELAY = 0.1
-MAX_DELAY = 0.4
-MAX_THREADS = 30
+MAX_THREADS = 25
 MAX_CRAWL_DEPTH = 2
 lock = threading.Lock()
-visited_urls = set()
-vulnerable_urls = set()
-tested_urls = set()
-results_csv = "vulnerable_urls.csv"
-vulnerable_txt = "vulnerable_urls.txt"
-safe_txt = "safe_urls.txt"
 VERBOSE = False
 
 user_agents = [
@@ -62,10 +48,23 @@ payloads = [
     TEST_DOMAIN.replace("https://", "%68%74%74%70%73%3A%2F%2F")
 ]
 
+# ---------------- CORES ----------------
+RED = "\033[91m"
+GREEN = "\033[92m"
+BLUE = "\033[94m"
+RESET = "\033[0m"
+
+vulnerable_txt = "vulnerable_urls.txt"
+safe_txt = "safe_urls.txt"
+results_csv = "vulnerable_urls.csv"
+
+visited_urls = set()
+discovered_subdomains = set()
+
 # ---------------- FUNÇÕES AUXILIARES ----------------
 def log(msg):
     if VERBOSE:
-        print(msg)
+        print(msg, flush=True)
 
 def random_headers():
     return {"User-Agent": random.choice(user_agents)}
@@ -76,17 +75,25 @@ def save_result(url, param, payload, location, status):
             writer = csv.writer(f)
             writer.writerow([url, param, payload, status, location])
         with open(vulnerable_txt, "a", encoding="utf-8") as f:
-            f.write(f"{url}\n")
+            f.write(f"{url} | {param}={payload}\n")
 
-def mark_safe(url):
+def mark_safe(url, param, payload):
     with lock:
         with open(safe_txt, "a", encoding="utf-8") as f:
-            f.write(f"{url}\n")
+            f.write(f"{url} | {param}={payload}\n")
+
+# ---------------- NORMALIZAÇÃO DE URL ----------------
+def normalize_url(url):
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
 
 # ---------------- TESTE DE OPEN REDIRECT ----------------
-def test_url(base_url, param, payload):
+def test_url(url, param, payload):
+    url = normalize_url(url)
     try:
-        parsed = urlparse(base_url)
+        parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
         query_params[param] = payload
         new_query = urlencode(query_params, doseq=True)
@@ -95,174 +102,179 @@ def test_url(base_url, param, payload):
         resp = requests.get(new_url, headers=random_headers(), timeout=6, allow_redirects=False)
         location = resp.headers.get("Location", "")
 
-        if resp.status_code in (301,302,303,307,308) and TEST_DOMAIN in location:
-            with lock:
-                if base_url not in vulnerable_urls:
-                    vulnerable_urls.add(base_url)
-            print(f"[VULNERÁVEL] {base_url} -> {location}")
-            save_result(base_url, param, payload, location, resp.status_code)
-        else:
-            print(f"[SEGURO] {base_url}")
-            mark_safe(base_url)
+        with lock:
+            if resp.status_code in (301,302,303,307,308) and TEST_DOMAIN in location:
+                print(f"{GREEN}[VULNERÁVEL]{RESET} {new_url} -> {location} | Payload: {payload}", flush=True)
+                save_result(url, param, payload, location, resp.status_code)
+            else:
+                print(f"{RED}[SEGURO]{RESET} {new_url} | Payload: {payload}", flush=True)
+                mark_safe(url, param, payload)
     except Exception as e:
-        log(f"[ERRO] {base_url}: {e}")
-    time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+        with lock:
+            print(f"[ERRO] {url}: {e}", flush=True)
 
-# ---------------- CRAWLER ----------------
+# ---------------- CRAWLER AVANÇADO ----------------
+def extract_params(html):
+    params = set()
+    soup = BeautifulSoup(html, "html.parser")
+
+    for form in soup.find_all("form"):
+        for inp in form.find_all("input", {"name": True}):
+            params.add(inp['name'])
+
+    scripts = soup.find_all("script")
+    for s in scripts:
+        matches = re.findall(r'[?&](\w+)=', s.text)
+        for m in matches:
+            params.add(m)
+
+    try:
+        json_objs = re.findall(r'{.*}', html)
+        for obj in json_objs:
+            data = json.loads(obj)
+            for key in data.keys():
+                params.add(key)
+    except:
+        pass
+
+    return params
+
 def crawl(url, depth, executor):
+    url = normalize_url(url)
     if depth > MAX_CRAWL_DEPTH:
         return
     with lock:
         if url in visited_urls:
             return
         visited_urls.add(url)
+
     try:
         resp = requests.get(url, headers=random_headers(), timeout=6)
         if "text/html" not in resp.headers.get("Content-Type",""):
             return
+        params = extract_params(resp.text)
         soup = BeautifulSoup(resp.text, "html.parser")
         links = [urljoin(url, a["href"]) for a in soup.find_all("a", href=True)]
-        for link in links:
-            print(f"[COLETADA] {link}")
-    except Exception as e:
-        log(f"[ERRO] Crawling {url}: {e}")
-        links = []
-    for link in links:
-        if urlparse(link).scheme.startswith("http"):
-            with lock:
-                if link not in visited_urls:
-                    executor.submit(crawl, link, depth+1, executor)
-            if "?" in link:
-                for param in params_to_test:
-                    for payload in payloads:
-                        executor.submit(test_url, link, param, payload)
 
-# ---------------- COLETA DE URLs ----------------
-def get_wayback_urls(domain):
+        domain = urlparse(url).netloc
+        for link in links:
+            parsed = urlparse(link)
+            if parsed.netloc and parsed.netloc != domain:
+                with lock:
+                    discovered_subdomains.add(parsed.netloc)
+    except:
+        params = set()
+        links = []
+
+    for param in params.union(params_to_test):
+        for payload in payloads:
+            executor.submit(test_url, url, param, payload)
+
+    for link in links:
+        parsed_link = urlparse(link)
+        if parsed_link.scheme.startswith("http") and parsed_link.netloc.endswith(urlparse(url).netloc):
+            executor.submit(crawl, link, depth+1, executor)
+
+# ---------------- COLETA DE URLS ----------------
+def collect_wayback(domain):
     urls = set()
     try:
-        log(f"[INFO] Wayback Machine: coletando URLs de {domain}")
-        resp = requests.get(f"http://web.archive.org/cdx/search/cdx?url={domain}/*&output=json&fl=original&collapse=urlkey", timeout=10)
+        resp = requests.get(f"https://web.archive.org/cdx/search/cdx?url={domain}/*&output=json&fl=original&collapse=urlkey", timeout=15)
         data = resp.json()
         for entry in data[1:]:
-            if "?" in entry[0]:
-                urls.add(entry[0])
-                print(f"[COLETADA] {entry[0]}")
-        log(f"[INFO] Wayback Machine: {len(urls)} URLs coletadas")
+            url = entry[0]
+            if url.startswith("http") and domain in url:
+                urls.add(url)
+                log(f"{BLUE}[WAYBACK]{RESET} {url}")
     except:
-        log("[!] Falha Wayback Machine")
+        pass
     return urls
 
-def get_duckduckgo_urls(domain, max_pages=2):
+def collect_search_engines(domain):
     urls = set()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for page in range(max_pages):
+    headers = {"User-Agent": random.choice(user_agents)}
+    for page in range(2):
         try:
-            q = f"site:{domain}"
-            r = requests.get(f"https://html.duckduckgo.com/html/?q={q}&s={page*50}", headers=headers, timeout=10)
+            r = requests.get(f"https://www.bing.com/search?q=site:{domain}&first={page*10}", headers=headers, timeout=10)
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a['href']
-                if domain in href and "?" in href:
+                if domain in urlparse(href).netloc:
                     urls.add(href)
-                    print(f"[COLETADA] {href}")
-            time.sleep(1)
         except:
             pass
-    log(f"[INFO] DuckDuckGo: {len(urls)} URLs coletadas")
-    return urls
-
-def get_bing_urls(domain, max_pages=2):
-    urls = set()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for page in range(max_pages):
+    for page in range(2):
         try:
-            q = f"site:{domain}"
-            r = requests.get(f"https://www.bing.com/search?q={q}&first={page*10}", headers=headers, timeout=10)
+            r = requests.get(f"https://html.duckduckgo.com/html/?q=site:{domain}&s={page*50}", headers=headers, timeout=10)
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a['href']
-                if domain in href and "?" in href:
+                if domain in urlparse(href).netloc:
                     urls.add(href)
-                    print(f"[COLETADA] {href}")
-            time.sleep(1)
         except:
             pass
-    log(f"[INFO] Bing: {len(urls)} URLs coletadas")
+    for page in range(2):
+        try:
+            r = requests.get(f"https://www.google.com/search?q=site:{domain}&start={page*10}", headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a['href']
+                if domain in urlparse(href).netloc:
+                    urls.add(href)
+        except:
+            pass
     return urls
-
-# ---------------- SUBDOMÍNIOS C99.nl ----------------
-def get_subdomains_c99(domain):
-    subdomains = set()
-    try:
-        print(f"[INFO] Coletando subdomínios via C99.nl para {domain}")
-        url = f"https://subdomainfinder.c99.nl/{domain}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for td in soup.find_all("td"):
-            sub = td.get_text().strip()
-            if domain in sub:
-                subdomains.add(sub)
-                print(f"[COLETADA] Subdomínio: {sub}")
-        print(f"[INFO] Subdomínios encontrados: {len(subdomains)}")
-    except Exception as e:
-        print(f"[!] Falha ao buscar subdomínios: {e}")
-    return subdomains
 
 # ---------------- MAIN ----------------
 def main():
     global VERBOSE
-    parser = argparse.ArgumentParser(description="Open Redirect Scanner completo")
+    parser = argparse.ArgumentParser(description="Open Redirect Scanner Ultra-Avançado")
     parser.add_argument("-u", "--url", help="URL única para testar")
     parser.add_argument("-l", "--list", help="Arquivo com lista de URLs")
     parser.add_argument("-v", "--verbose", action="store_true", help="Modo verbose")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
-    # CSV e TXT
+    urls_to_scan = set()
+
+    if args.url:
+        urls_to_scan.add(args.url)
+        domain = urlparse(normalize_url(args.url)).netloc
+        urls_to_scan.update(collect_wayback(domain))
+        urls_to_scan.update(collect_search_engines(domain))
+    elif args.list:
+        with open(args.list, "r") as f:
+            urls_to_scan.update(normalize_url(line.strip()) for line in f if line.strip())
+    else:
+        print("[!] Informe -u <URL> ou -l <arquivo>")
+        return
+
     with open(results_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["URL", "Parâmetro", "Payload", "Status Code", "Location"])
     open(vulnerable_txt, "w").close()
     open(safe_txt, "w").close()
 
-    urls_to_scan = set()
-
-    if args.url:
-        urls_to_scan.add(args.url)
-        domain = urlparse(args.url).netloc
-        # Subdomínios via C99.nl
-        subdomains = get_subdomains_c99(domain)
-        for sub in subdomains:
-            urls_to_scan.add(f"http://{sub}")
-            urls_to_scan.add(f"https://{sub}")
-        # URLs históricas e indexadas
-        urls_to_scan.update(get_wayback_urls(domain))
-        urls_to_scan.update(get_duckduckgo_urls(domain))
-        urls_to_scan.update(get_bing_urls(domain))
-    elif args.list:
-        try:
-            with open(args.list, "r") as f:
-                urls_to_scan.update(line.strip() for line in f if "http" in line)
-        except:
-            print("[!] Arquivo inválido")
-            return
-    else:
-        print("[!] Informe -u <URL> ou -l <arquivo>")
-        return
-
-    log(f"[INFO] Total de URLs coletadas para scan: {len(urls_to_scan)}")
+    print(f"[INFO] Total URLs coletadas: {len(urls_to_scan)}", flush=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = []
         for url in urls_to_scan:
-            # Crawl
-            executor.submit(crawl, url, 0, executor)
-            # Teste imediato se a URL tiver parâmetros
-            if "?" in url:
-                for param in params_to_test:
-                    for payload in payloads:
-                        executor.submit(test_url, url, param, payload)
+            futures.append(executor.submit(crawl, url, 0, executor))
+        concurrent.futures.wait(futures)
+
+    print("\n==================== RESUMO ====================", flush=True)
+    with open(vulnerable_txt, "r") as f:
+        vuln_lines = f.readlines()
+    with open(safe_txt, "r") as f:
+        safe_lines = f.readlines()
+    print(f"Total URLs testadas: {len(vuln_lines) + len(safe_lines)}", flush=True)
+    print(f"{GREEN}Vulneráveis: {len(vuln_lines)}{RESET}", flush=True)
+    print(f"{RED}Seguras: {len(safe_lines)}{RESET}", flush=True)
+    print("================================================", flush=True)
+    print(f"{BLUE}Subdomínios descobertos:{RESET}", flush=True)
+    for sub in discovered_subdomains:
+        print(f"{sub}", flush=True)
 
 if __name__ == "__main__":
     main()
